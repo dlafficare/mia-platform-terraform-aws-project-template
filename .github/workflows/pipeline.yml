@@ -1,0 +1,125 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Deploy Workflow
+on: deployment
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.deployment.environment }} environment
+    environment: ${{ github.event.deployment.environment }}
+    concurrency: ${{ github.event.deployment.environment }}
+    permissions:
+      deployments: write
+      contents: write
+    runs-on: ubuntu-latest
+    container: miaplatform/mlp:2.1.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update deployment status (pending)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          state: 'pending'
+          deployment-id: ${{ github.event.deployment.id }}
+      - name: Provision infrastructure with Terraform
+        env:
+          TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TERRAFORM_VERSION: 1.14.2
+          TERRAFORM_WORK_DIR: ${{ github.workspace }}/terraform-work
+          MODULES_BASE_DIR: ${{ github.workspace }}/manifests/terraform/environments/${{ github.event.deployment.environment }}
+          PROJECT_NAME: "%project.name%"
+          ENVIRONMENT: ${{ github.event.deployment.environment }}
+        run: |
+          echo "==> Installing Git and jq"
+          apk add --quiet --no-cache git jq
+          
+          echo "==> Configuring Git credentials for GitHub"
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+          
+          echo "==> Calculating workspace name from project name and environment"
+          APP_NAME=$(echo "${PROJECT_NAME}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          ENV_LOWER=$(echo "${ENVIRONMENT}" | tr '[:upper:]' '[:lower:]')
+          WORKSPACE_NAME="mia-${APP_NAME}-main-${ENV_LOWER}"
+          echo "Project name: ${PROJECT_NAME}"
+          echo "Environment: ${ENVIRONMENT}"
+          echo "Workspace name: ${WORKSPACE_NAME}"
+          
+          echo "==> Installing Terraform CLI ${TERRAFORM_VERSION}"
+          wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+          unzip -q terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+          mv terraform /usr/local/bin/
+          rm terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+          terraform version
+          
+          echo "==> Configuring Terraform Cloud credentials"
+          mkdir -p ~/.terraform.d
+          cat > ~/.terraform.d/credentials.tfrc.json << EOF
+          {
+            "credentials": {
+              "app.terraform.io": {
+                "token": "${TF_API_TOKEN}"
+              }
+            }
+          }
+          EOF
+          
+          echo "==> Generating Terraform configuration from Console resources"
+          MODULES_BASE_DIR="${MODULES_BASE_DIR}" TERRAFORM_WORK_DIR="${TERRAFORM_WORK_DIR}" WORKSPACE_NAME="${WORKSPACE_NAME}" \
+            sh "${GITHUB_WORKSPACE}/.github/scripts/generate-terraform.sh"
+          cd ${TERRAFORM_WORK_DIR}
+
+          echo ""
+          echo "==> Initializing Terraform with HCP Terraform backend"
+          terraform init
+          
+          echo ""
+          echo "==> Applying infrastructure changes (plan runs automatically in HCP Terraform)"
+          terraform apply -auto-approve
+      - name: Commit generated Terraform files
+        if: success()
+        env:
+          TERRAFORM_WORK_DIR: ${{ github.workspace }}/terraform-work
+          ENVIRONMENT: ${{ github.event.deployment.environment }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "==> Setting up clean git repository for commit"
+          GIT_REPO_DIR="/tmp/repo-for-commit"
+          
+          git config --global --add safe.directory "${GIT_REPO_DIR}"
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${GIT_REPO_DIR}"
+          cd "${GIT_REPO_DIR}"
+          git checkout "${GITHUB_REF_NAME}"
+          
+          echo "==> Copying generated files to repository"
+          TARGET_DIR="${GIT_REPO_DIR}/environments/${ENVIRONMENT}/terraform"
+          mkdir -p "${TARGET_DIR}"
+          cp -v "${TERRAFORM_WORK_DIR}/main.tf" "${TARGET_DIR}/"
+          cp -v "${TERRAFORM_WORK_DIR}/"*.variables.tf "${TARGET_DIR}/" 2>/dev/null || echo "No variable files to copy"
+          cp -v "${TERRAFORM_WORK_DIR}/deployments.json" "${TARGET_DIR}/" 2>/dev/null || echo "No deployments.json to copy"
+          
+          echo "==> Configuring git identity"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          echo "==> Staging changes"
+          git add "environments/${ENVIRONMENT}/terraform/"
+          
+          echo "==> Committing changes"
+          git diff --staged --quiet || git commit -m "chore: update terraform config for ${ENVIRONMENT} environment"
+          
+          echo "==> Pushing changes"
+          git push origin "${GITHUB_REF_NAME}"
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          state: 'success'
+          deployment-id: ${{ github.event.deployment.id }}
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          state: 'failure'
+          deployment-id: ${{ github.event.deployment.id }}

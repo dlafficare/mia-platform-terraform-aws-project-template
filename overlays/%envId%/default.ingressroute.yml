@@ -1,0 +1,25 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: default-ingress
+  labels:
+    app.kubernetes.io/instance: "ingress-controller"
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    %#hosts%
+    - match: Host(`%host%`)
+      middlewares:
+        - name: "ingress-controller-hsts-headers"
+          namespace: ingress-system
+      kind: Rule
+      services:
+        - name: api-gateway
+          %#isBackoffice%
+          port: 8081
+          %/isBackoffice%
+          %^isBackoffice%
+          port: 8080
+          %/isBackoffice%
+    %/hosts%
