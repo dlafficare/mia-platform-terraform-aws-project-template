@@ -13,7 +13,6 @@ set -eu
 
 TF_ORGANIZATION="${TF_ORGANIZATION:-mia-platform}"
 TF_BACKEND="${TF_BACKEND:-cloud}"
-REF_PATTERN='"ref:([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+)"'
 
 VARS_FILES=$(find "${MODULES_BASE_DIR}" -type f -name "*.variables.tf" 2>/dev/null | sort || true)
 
@@ -58,7 +57,7 @@ TFEOF
 
 for VARS_FILE in $VARS_FILES; do
   BASENAME=$(basename "$VARS_FILE")
-  MODULE_NAME="${BASENAME%.variables.tf}"
+  MODULE_NAME=$(basename "$VARS_FILE" .variables.tf)
   echo ""
   echo "Processing module: $MODULE_NAME"
 
@@ -85,9 +84,9 @@ for VARS_FILE in $VARS_FILES; do
   fi
   rm -rf "$CONSOLE_DIR"
   # terraform console prints the JSON document as a quoted string
-  VALUES=$(printf '%s\n' "$CONSOLE_OUT" | jq -r '.')
+  VALUES=$(jq -rn --arg v "$CONSOLE_OUT" '$v | fromjson')
 
-  MODULE_SOURCE=$(printf '%s\n' "$VALUES" | jq -r '._module_source')
+  MODULE_SOURCE=$(jq -rn --argjson v "$VALUES" '$v._module_source')
   if [ -z "$MODULE_SOURCE" ] || [ "$MODULE_SOURCE" = "null" ]; then
     echo "ERROR: _module_source is missing in $VARS_FILE"
     exit 1
@@ -102,19 +101,20 @@ for VARS_FILE in $VARS_FILES; do
   } >> "$MAIN_TF"
 
   for VAR_NAME in $VAR_NAMES; do
-    VALUE_JSON=$(printf '%s\n' "$VALUES" | jq -c --arg k "$VAR_NAME" '.[$k]')
-    RAW=$(printf '%s\n' "$VALUE_JSON" | jq -r 'if type == "string" then . else tojson end')
+    # Text processing is done with jq: this file must not contain the percent sign,
+    # which the Console interprets as a placeholder when it copies the template
+    RAW=$(jq -rn --argjson v "$VALUES" --arg k "$VAR_NAME" '$v[$k] | if type == "string" then . else tojson end')
 
-    if printf '%s\n' "$RAW" | grep -Eq '^ref:[A-Za-z0-9_-]+\.[A-Za-z0-9_]+$'; then
+    if [ "$(jq -rn --arg r "$RAW" '$r | test("^ref:[A-Za-z0-9_-]+[.][A-Za-z0-9_]+$")')" = "true" ]; then
       # Whole value is a reference to another resource
-      HCL=$(printf '%s\n' "$RAW" | sed -E 's/^ref:([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+)$/module.\1.\2/')
+      HCL=$(jq -rn --arg r "$RAW" '$r | sub("^ref:(?<m>[A-Za-z0-9_-]+)[.](?<o>[A-Za-z0-9_]+)$"; "module.\(.m).\(.o)")')
       echo "  Linking: ${VAR_NAME} = ${HCL}"
-    elif JSON=$(printf '%s\n' "$RAW" | jq -ce 'select(type == "object" or type == "array")' 2>/dev/null); then
+    elif JSON=$(jq -cen --arg r "$RAW" '$r | fromjson? | select(type == "object" or type == "array")' 2>/dev/null); then
       # JSON object/array (form fields typed as JSON): passed as an HCL value so that its
       # keys are known at plan time, with references replaced by module outputs
-      HCL=$(printf '%s\n' "$JSON" | sed -E "s/${REF_PATTERN}/module.\\1.\\2/g")
+      HCL=$(jq -rn --arg j "$JSON" '$j | gsub("\"ref:(?<m>[A-Za-z0-9_-]+)[.](?<o>[A-Za-z0-9_]+)\""; "module.\(.m).\(.o)")')
       if [ "$HCL" != "$JSON" ]; then echo "  Linking: ${VAR_NAME} = ${HCL}"; fi
-    elif printf '%s\n' "$RAW" | grep -q 'ref:'; then
+    elif [ "$(jq -rn --arg r "$RAW" '$r | contains("ref:")')" = "true" ]; then
       echo "ERROR: ${MODULE_NAME}.${VAR_NAME} contains a reference but is neither 'ref:<resource>.<output>' nor a JSON object"
       exit 1
     else
